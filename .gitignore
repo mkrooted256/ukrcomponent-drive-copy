@@ -1,0 +1,6 @@
+*.csv
+*.json
+*.md
+*.lock
+.venv
+__pycache__
