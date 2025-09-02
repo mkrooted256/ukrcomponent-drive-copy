@@ -141,22 +141,33 @@ def drive_create(service, body: dict, fields: str):
     return with_retries(lambda: service.files().create(body=body, fields=fields, supportsAllDrives=True).execute(),
                         op_desc=f"files.create {body.get('name','<no-name>')}")
 
-def auth_drive():
+def auth_drive(token_file):
     creds = None
-    if os.path.exists("token.json"):
-        creds = Credentials.from_authorized_user_file("token.json", SCOPES)
-    # If there are no (valid) credentials available, let the user log in.
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(
-                "credentials.json", SCOPES
-            )
-            creds = flow.run_local_server(port=0)
-        # Save the credentials for the next run
-        with open("token.json", "w") as token:
-            token.write(creds.to_json())
+    if token_file:
+        creds = Credentials.from_authorized_user_file(token_file, SCOPES)
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                logger.info("Token ok but expired. Refreshing")
+                creds.refresh(Request())
+                # with open(token_file, "w") as token:
+                #     token.write(creds.to_json())
+            else:
+                raise ValueError("Invalid token file")
+    else:
+        if os.path.exists("token.json"):
+            creds = Credentials.from_authorized_user_file("token.json", SCOPES)
+        # If there are no (valid) credentials available, let the user log in.
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            else:
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    "credentials.json", SCOPES
+                )
+                creds = flow.run_local_server(port=0)
+            # Save the credentials for the next run
+            with open("token.json", "w") as token:
+                token.write(creds.to_json())
     
     service = build("drive", "v3", credentials=creds)
     return service
@@ -323,9 +334,9 @@ def perform_copy(service,
                  df: pd.DataFrame,
                  inventory_csv: str,
                  selected_roots: List[str],
-                 dest_root_parent_id: str,
+                #  dest_root_parent_id: str,
                  name_prefix: str = ""):
-    validate_dest_is_folder(service, dest_root_parent_id)
+    # validate_dest_is_folder(service, dest_root_parent_id)
 
     # Index by id for in-place updates
     if 'id_indexed' not in df.attrs:
@@ -360,7 +371,7 @@ def perform_copy(service,
                 new_dest_id = dest_id
             else:
                 dest_name = f"{name_prefix}{root_row['name']}" if name_prefix else root_row['name']
-                new_dest_id = ensure_dest_folder(service, dest_name, dest_root_parent_id)
+                new_dest_id = ensure_dest_folder(service, dest_name, root_row['root_dest_id'])
             folder_map[root_id] = new_dest_id
             # Update row
             df.at[root_id, 'dest_id'] = new_dest_id
@@ -399,7 +410,7 @@ def perform_copy(service,
         # Determine destination parent folder ID
         if src_parent is None:
             # Root item itself
-            dest_parent_id = dest_root_parent_id
+            dest_parent_id = row['root_dest_id']
         else:
             # For folders/files not at root, the parent must have been created already
             parent_dest = df.at[src_parent, 'dest_id'] if (src_parent in df.index and df.at[src_parent, 'dest_id']) else None
@@ -488,7 +499,7 @@ def parse_root_selection(folder_rows: List[dict], explicit_ids: Optional[str]) -
     return [r['id'] for r in folder_rows]
 
 def cmd_scan(args):
-    service = auth_drive()
+    service = auth_drive(args.token_file)
     df = load_inventory(args.inventory_csv)
     folders = read_folders_csv(args.folders_csv, default_dest_id=args.dest_id)
 
@@ -501,7 +512,7 @@ def cmd_scan(args):
     logger.info(f"Scan complete. Inventory saved to {args.inventory_csv}")
 
 def cmd_copy(args):
-    service = auth_drive()
+    service = auth_drive(args.token_file)
     folders = read_folders_csv(args.folders_csv, default_dest_id=args.dest_id)
     selected_root_ids = parse_root_selection(folders, args.select_root_ids)
 
@@ -523,6 +534,7 @@ def main():
     p_scan.add_argument('--inventory-csv', default='drive_inventory.csv', help='Path to inventory CSV to write/update')
     p_copy.add_argument('--dest-id', default=None, help='Default destination parent folder ID (for folders without destination_id)')
     p_scan.add_argument('--batch-flush', type=int, default=200, help='Flush inventory to disk after this many new rows')
+    p_scan.add_argument('--token-file', default=None, help='Custom google drive api token')
     p_scan.set_defaults(func=cmd_scan)
 
     p_copy = sub.add_parser('copy', help='Copy selected roots to destination, updating inventory CSV')
@@ -531,6 +543,7 @@ def main():
     p_copy.add_argument('--dest-id', default=None, help='Default destination parent folder ID (for folders without destination_id)')
     p_copy.add_argument('--select-root-ids', default=None, help='Comma-separated list of root IDs to copy (overrides selected column)')
     p_copy.add_argument('--name-prefix', default='', help='Prefix for destination root folder names')
+    p_scan.add_argument('--token-file', default=None, help='Custom google drive api token')
     p_copy.set_defaults(func=cmd_copy)
 
     args = parser.parse_args()
