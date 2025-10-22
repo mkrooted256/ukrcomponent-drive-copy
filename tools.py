@@ -45,7 +45,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import google.auth
-from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
 SCOPES = [
   "https://www.googleapis.com/auth/drive.metadata.readonly",
@@ -113,13 +113,14 @@ def with_retries(call, max_retries=8, initial_delay=1.0, max_delay=64.0, op_desc
                 continue
             # Non-retryable or exhausted retries
             raise
-        except Exception:
+        except Exception as e:
             # Networking or other transient exceptions could be retried; simple backoff
             attempt += 1
             if attempt <= max_retries:
                 sleep_for = min(max_delay, delay * (2 ** (attempt - 1)))
                 sleep_for = sleep_for * (0.5 + random.random() * 0.5)
-                logger.error(f"Unexpected error on {op_desc or 'API call'} (attempt {attempt}/{max_retries}). Sleeping {sleep_for:.1f}s")
+                logger.error(f"Unexpected error on {op_desc or 'API call'} (attempt {attempt}/{max_retries}). Sleeping {sleep_for:.1f}s: "
+                             f"{e}")
                 time.sleep(sleep_for)
                 continue
             raise
@@ -128,7 +129,7 @@ def with_retries(call, max_retries=8, initial_delay=1.0, max_delay=64.0, op_desc
 # Drive API wrappers (with retries)
 # ----------------------------
 def drive_list(service, **kwargs):
-    return with_retries(lambda: service.files().list(supportsAllDrives=True,**kwargs).execute(), op_desc="files.list")
+    return with_retries(lambda: service.files().list(supportsAllDrives=True, **kwargs).execute(), op_desc="files.list")
 
 def drive_get(service, file_id: str, fields: str):
     return with_retries(lambda: service.files().get(fileId=file_id, fields=fields, supportsAllDrives=True).execute(),
@@ -141,6 +142,43 @@ def drive_copy(service, file_id: str, body: dict, fields: Optional[str] = None):
 def drive_create(service, body: dict, fields: str):
     return with_retries(lambda: service.files().create(body=body, fields=fields, supportsAllDrives=True).execute(),
                         op_desc=f"files.create {body.get('name','<no-name>')}")
+
+def drive_download(service, file_id: str, local_path: str):
+    """Download a file from Drive to local storage"""
+    # UNTESTED!!
+    try:
+        request = service.files().get_media(fileId=file_id)
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        
+        # logger.info(f"Downloading '{file_id}'")
+        with open(local_path, 'wb') as fh:
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while not done:
+                status, done = downloader.next_chunk()
+    except Exception as e:
+        if os.path.exists(local_path):
+            os.remove(local_path)
+        raise
+
+def drive_export(service, file_id: str, local_path: str, mime_type: str = 'application/pdf'):
+    """Export and download a file from Drive in the specified format"""
+    try:
+        request = service.files().export_media(fileId=file_id, mimeType=mime_type)
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        logger.info(f"Downloading '{file_id}'")
+        with open(local_path, 'wb') as fh:
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            nchunk = 1
+            while not done:
+                if nchunk > 1: logger.debug(f"Downloading '{file_id}' chunk {nchunk}")
+                status, done = downloader.next_chunk()
+                nchunk += 1
+    except Exception as e:
+        if os.path.exists(local_path):
+            os.remove(local_path)
+        raise
 
 def auth_drive(token_file):
     creds = None
@@ -184,7 +222,8 @@ INV_COLUMNS = [
     'root_id', 'root_name',
     'id', 'name', 'mimeType', 'parent_id', 'path',
     'size', 'modifiedTime',
-    'status', 'dest_id', 'error', 'last_attempt', 'retries'
+    'status', 'dest_id', 'error', 'last_attempt', 'retries',
+    'local_path'
 ]
 
 def ensure_inventory(df: Optional[pd.DataFrame]) -> pd.DataFrame:
@@ -222,21 +261,35 @@ def flush_inventory(df: pd.DataFrame, inventory_csv: str):
 # ----------------------------
 # Scan logic
 # ----------------------------
-def list_children(service, folder_id: str, page_token: Optional[str] = None) -> Tuple[List[dict], Optional[str]]:
-    resp = drive_list(
-        service,
-        q=f"'{folder_id}' in parents and trashed = false",
-        spaces='drive',
-        fields='nextPageToken, files(id,name,mimeType,parents,size,modifiedTime)',
-        pageToken=page_token
-    )
+def list_children(service, folder_id: str, page_token: Optional[str] = None, drive_id = None) -> Tuple[List[dict], Optional[str]]:
+    if drive_id:
+        # Different semantics in shared drives
+        resp = drive_list(
+            service,
+            q=f"'{folder_id}' in parents and trashed = false",
+            spaces='drive', # spaces is 'drive' or 'appDataFolder'.
+            corpora='drive',
+            driveId=drive_id,
+            includeItemsFromAllDrives=True, # for some fucking reason
+            fields='nextPageToken, files(id,name,mimeType,parents,size,modifiedTime,driveId)',
+            pageToken=page_token
+        )
+    else:
+        resp = drive_list(
+            service,
+            q=f"'{folder_id}' in parents and trashed = false",
+            spaces='drive',
+            fields='nextPageToken, files(id,name,mimeType,parents,size,modifiedTime)',
+            pageToken=page_token
+        )
     return resp.get('files', []), resp.get('nextPageToken')
 
 def scan_root(service, df: pd.DataFrame, root_id: str, root_name: str, root_dest_id:str, inventory_csv: str, batch_flush: int = 200):
     # Get root metadata (name may be refreshed)
     try:
-        meta = drive_get(service, root_id, fields='id,name,mimeType,parents,size,modifiedTime')
+        meta = drive_get(service, root_id, fields='id,name,mimeType,parents,size,modifiedTime,driveId')
         root_name = meta.get('name', root_name)
+        root_driveId = meta.get('driveId', None)
     except HttpError as e:
         logger.error(f"Failed to read root {root_id}: {e}")
         return
@@ -254,11 +307,11 @@ def scan_root(service, df: pd.DataFrame, root_id: str, root_name: str, root_dest
             if not df.at[item_id, 'path']:
                 df.at[item_id, 'path'] = path
             return False
-        df.loc[item_id, ['root_id', 'root_name', 'root_dest_id', 'id', 'name', 'mimeType', 'parent_id',
+        df.loc[item_id, ['root_id', 'root_name', 'root_dest_id', 'id', 'name', 'mimeType', 'parent_id', 'drive_id',
                          'path', 'size', 'modifiedTime', 'status', 'dest_id', 'error',
                          'last_attempt', 'retries']] = [
             root_id, root_name, root_dest_id, item['id'], item.get('name'), item.get('mimeType'),
-            (item.get('parents') or [None])[0], path, item.get('size'),
+            (item.get('parents') or [None])[0], item.get('driveId'), path, item.get('size'),
             item.get('modifiedTime'), 'pending', None, None, None, 0
         ]
         return True
@@ -271,9 +324,13 @@ def scan_root(service, df: pd.DataFrame, root_id: str, root_name: str, root_dest
         'mimeType': 'application/vnd.google-apps.folder',
         'parents': [None],
         'size': None,
-        'modifiedTime': meta.get('modifiedTime')
+        'modifiedTime': meta.get('modifiedTime'),
+        'driveId': root_driveId
     }
     add_row(root_item, parent_path="")
+
+    if root_driveId:
+        logger.info(f"! Root {root_name} ({root_id}) is on a shared drive (https://drive.google.com/drive/folders/{root_driveId})")
 
     # Iterative DFS to avoid recursion limits
     stack = [(root_id, root_name)]  # (folder_id, path)
@@ -283,7 +340,7 @@ def scan_root(service, df: pd.DataFrame, root_id: str, root_name: str, root_dest
         current_id, current_path = stack.pop()
         page = None
         while True:
-            children, page = list_children(service, current_id, page)
+            children, page = list_children(service, current_id, page, drive_id=root_driveId)
             for ch in children:
                 is_new = add_row(ch, parent_path=current_path)
                 if ch['mimeType'] == 'application/vnd.google-apps.folder':
@@ -467,6 +524,180 @@ def perform_copy(service,
 
     logger.info("Copy complete.")
 
+direct_download_mime = [
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document', # docx
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation', # pptx
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', # xlsx
+    'application/vnd.oasis.opendocument.text', # odt
+    'application/vnd.oasis.opendocument.spreadsheet',
+    'application/vnd.oasis.opendocument.presentation',
+    'application/pdf',
+    'text/plain',
+    'text/markdown',
+    'text/csv',
+    'text/tab-separated-values',
+    'image/jpeg',
+    'image/png',
+    'image/svg+xml',
+    'image/gif'
+    'image/tiff'
+    'application/mp4',
+    'audio/mpeg',
+    'audio/ogg',
+    'audio/vnd.dlna.adts' # AAC
+    'application/zip'
+]
+
+GOOGLE_MIME_EXPORT_TYPES = {
+    'application/vnd.google-apps.document': 'application/pdf',
+    'application/vnd.google-apps.spreadsheet': 'application/pdf',
+    'application/vnd.google-apps.presentation': 'application/pdf',
+    'application/vnd.google-apps.drawing': 'application/pdf',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'application/pdf',
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'application/pdf',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'application/pdf',
+}
+
+def export_inventory_as_pdf(service, df: pd.DataFrame, inventory_csv: str, output_dir: str, batch_size, token_file):
+    if df.empty:
+        raise RuntimeError("Inventory is empty. Run 'scan' first to build the inventory CSV.")
+    
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Index by id for in-place updates
+    if 'id_indexed' not in df.attrs:
+        df.set_index('id', inplace=True, drop=False)
+        df.attrs['id_indexed'] = True
+    
+    # Filter for files only (not folders) that haven't been downloaded
+    to_download = df[
+        df['mimeType'].isin(GOOGLE_MIME_EXPORT_TYPES.keys()) & 
+        ((df['status'] != 'pdf_downloaded') | df['status'].isna())
+    ]
+
+    nfolders = len(df[df['mimeType'] == 'application/vnd.google-apps.folder'])
+    nexportable = len(df[df['mimeType'].isin(GOOGLE_MIME_EXPORT_TYPES.keys())])
+    logger.info(f"Found {nfolders} folders")
+    logger.info(f"Found {nfolders} folders, {nexportable} exportable files, {len(df)-nexportable-nfolders} ignored files")
+
+    total = len(to_download)
+    if total == 0:
+        logger.info("No new files to download")
+        return
+        
+    logger.info(f"Preparing to export {total} files")
+    processed = 0
+    
+    for idx, row in to_download.iterrows():
+        try:
+            # Calculate local path based on drive path
+            rel_path = row['path'].lstrip('/')
+            local_path = os.path.join(output_dir, rel_path) + '.pdf'
+            
+            # Skip if already downloaded successfully
+            if os.path.exists(local_path) and df.at[row['id'], 'status'] == 'pdf_downloaded':
+                continue
+                
+            logger.info(f"Exporting to pdf: {rel_path}")
+            
+            # Download file
+            drive_export(service, row['id'], local_path, mime_type='application/pdf')
+            
+            # Update status
+            df.at[row['id'], 'status'] = 'pdf_downloaded'
+            df.at[row['id'], 'local_path'] = local_path
+            df.at[row['id'], 'error'] = None
+            df.at[row['id'], 'last_attempt'] = _now_iso()
+            
+            processed += 1
+            if processed % batch_size == 0:
+                flush_inventory(df.reset_index(drop=True), inventory_csv)
+                logger.info(f"Progress: {processed}/{total} files exported to pdf")
+                
+        except Exception as e:
+            df.at[row['id'], 'status'] = 'error'
+            df.at[row['id'], 'error'] = str(e)
+            df.at[row['id'], 'last_attempt'] = _now_iso()
+            df.at[row['id'], 'retries'] = int(df.at[row['id'], 'retries']) + 1
+            flush_inventory(df.reset_index(drop=True), inventory_csv)
+            logger.error(f"Error exporting to pdf {row['path']}: {e}")
+    
+    # Final flush
+    flush_inventory(df.reset_index(drop=True), inventory_csv)
+    logger.info(f"Export to pdf complete. {processed}/{total} files exported to pdf")
+
+
+def download_inventory(service, df: pd.DataFrame, inventory_csv: str, output_dir: str, batch_size, token_file):
+    if df.empty:
+        raise RuntimeError("Inventory is empty. Run 'scan' first to build the inventory CSV.")
+    
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Index by id for in-place updates
+    if 'id_indexed' not in df.attrs:
+        df.set_index('id', inplace=True, drop=False)
+        df.attrs['id_indexed'] = True
+    
+    # Filter for files only (not folders) that haven't been downloaded
+    to_download = df[
+        df['mimeType'].isin(GOOGLE_MIME_EXPORT_TYPES.keys()) & 
+        ((df['status'] != 'downloaded') | df['status'].isna())
+    ]
+
+    nfolders = len(df[df['mimeType'] == 'application/vnd.google-apps.folder'])
+    ndownloadable = len(df[df['mimeType'].isin(GOOGLE_MIME_EXPORT_TYPES.keys())])
+    logger.info(f"Found {nfolders} folders")
+    logger.info(f"Found {nfolders} folders, {ndownloadable} downloadable files, {len(df)-ndownloadable-nfolders} ignored files")
+
+    total = len(to_download)
+    if total == 0:
+        logger.info("No new files to download")
+        return
+        
+    logger.info(f"Preparing to download {total} files")
+    processed = 0
+    
+    for idx, row in to_download.iterrows():
+        try:
+            # Calculate local path based on drive path
+            rel_path = row['path'].lstrip('/')
+            local_path = os.path.join(output_dir, rel_path)
+            pdf_path = os.path.join(output_dir, rel_path) + '.pdf'
+            
+            # Skip if already downloaded successfully
+            if os.path.exists(local_path) and df.at[row['id'], 'status'] == 'downloaded':
+                continue
+                
+            logger.info(f"Downloading: {rel_path}")
+            
+            # Download file
+            drive_download(service, row['id'], local_path)
+            
+            # Update status
+            df.at[row['id'], 'status'] = 'downloaded'
+            df.at[row['id'], 'local_path'] = local_path
+            df.at[row['id'], 'error'] = None
+            df.at[row['id'], 'last_attempt'] = _now_iso()
+            
+            processed += 1
+            if processed % batch_size == 0:
+                flush_inventory(df.reset_index(drop=True), inventory_csv)
+                logger.info(f"Progress: {processed}/{total} files downloaded")
+                
+        except Exception as e:
+            df.at[row['id'], 'status'] = 'error'
+            df.at[row['id'], 'error'] = str(e)
+            df.at[row['id'], 'last_attempt'] = _now_iso()
+            df.at[row['id'], 'retries'] = int(df.at[row['id'], 'retries']) + 1
+            flush_inventory(df.reset_index(drop=True), inventory_csv)
+            logger.error(f"Error downloading {row['path']}: {e}")
+    
+    # Final flush
+    flush_inventory(df.reset_index(drop=True), inventory_csv)
+    logger.info(f"Download complete. {processed}/{total} files downloaded")
+
 
 # ----------------------------
 # CLI
@@ -484,7 +715,8 @@ def read_folders_csv(path: str, default_dest_id=None) -> List[dict]:
                 raise ValueError("folders.csv must have columns: name,id")
             if r['id'].startswith('https://') or r['id'].startswith('drive.google'):
                 r['id'] = gdrive_url_to_id(r['id'])
-            if r['destination_id'] and r['destination_id'].startswith('https://') or r['destination_id'].startswith('drive.google'):
+            if (r['destination_id'] and 
+                (r['destination_id'].startswith('https://') or r['destination_id'].startswith('drive.google'))):
                 r['destination_id'] = gdrive_url_to_id(r['destination_id'])
             rows.append({'id': r['id'], 'name': r['name'], 'destination_id': r['destination_id'], 'selected': str(r.get('selected', '')).strip().lower()})
     return rows
@@ -500,7 +732,15 @@ def parse_root_selection(folder_rows: List[dict], explicit_ids: Optional[str]) -
     # If none specified, default to all
     return [r['id'] for r in folder_rows]
 
-def cmd_scan(args):
+import argparse
+import sys
+from collections import namedtuple
+
+ScanParams = namedtuple('ScanParams','folders_csv,inventory_csv,dest_id,batch_flush,token_file')
+CopyParams = namedtuple('CopyParams','folders_csv,inventory_csv,dest_id,select_root_ids,name_prefix,token_file')
+DownloadParams = namedtuple('DownloadParams', 'inventory_csv,output_dir,batch_size,token_file')
+
+def cmd_scan(args: ScanParams):
     service = auth_drive(args.token_file)
     df = load_inventory(args.inventory_csv)
     folders = read_folders_csv(args.folders_csv, default_dest_id=args.dest_id)
@@ -513,7 +753,7 @@ def cmd_scan(args):
     flush_inventory(df.reset_index(drop=True), args.inventory_csv)
     logger.info(f"Scan complete. Inventory saved to {args.inventory_csv}")
 
-def cmd_copy(args):
+def cmd_copy(args: CopyParams):
     service = auth_drive(args.token_file)
     folders = read_folders_csv(args.folders_csv, default_dest_id=args.dest_id)
     selected_root_ids = parse_root_selection(folders, args.select_root_ids)
@@ -525,8 +765,9 @@ def cmd_copy(args):
     logger.info(f"Preparing to copy {len(selected_root_ids)} root(s)")
     perform_copy(service, df, args.inventory_csv, selected_root_ids, name_prefix=args.name_prefix or "")
 
-import argparse
-import sys
+def cmd_download(args: DownloadParams):
+    pass
+
 def main():
     parser = argparse.ArgumentParser(description="Google Drive scan and selective copy with progress tracking.")
     sub = parser.add_subparsers(dest='command', required=True)
