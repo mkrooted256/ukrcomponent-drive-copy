@@ -47,6 +47,9 @@ from googleapiclient.errors import HttpError
 import google.auth
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
+import docx2pdf
+import pptxtopdf
+
 SCOPES = [
   "https://www.googleapis.com/auth/drive.metadata.readonly",
   "https://www.googleapis.com/auth/drive"
@@ -179,6 +182,25 @@ def drive_export(service, file_id: str, local_path: str, mime_type: str = 'appli
         if os.path.exists(local_path):
             os.remove(local_path)
         raise
+
+def drive_upload(service, local_path: str, parent_id: str, desired_name: str=None, mime_type: str = None, fields: str = 'id,name,mimeType,parents'):
+    if not os.path.exists(local_path):
+        raise FileNotFoundError(f"Local file not found: {local_path}")
+    name = desired_name or os.path.basename(local_path)
+    metadata = {
+        'name': name,
+        'parents': [parent_id],
+    }
+    media = MediaFileUpload(local_path, mimetype=mime_type, resumable=True)
+    def _call_create():
+        req = service.files().create(
+            body=metadata,
+            media_body=media,
+            fields=fields,
+            supportsAllDrives=True  # required to work with shared drives
+        )
+        return req.execute()
+    return with_retries(_call_create, op_desc=f"upload '{local_path}' -> '{parent_id}'")
 
 def auth_drive(token_file):
     creds = None
@@ -698,6 +720,184 @@ def download_inventory(service, df: pd.DataFrame, inventory_csv: str, output_dir
     flush_inventory(df.reset_index(drop=True), inventory_csv)
     logger.info(f"Download complete. {processed}/{total} files downloaded")
 
+def convert_inventory_to_pdf(service, df_input: pd.DataFrame, inventory_csv: str, local_parent_dir: str, selected_roots: List[str], token_file, name_prefix: str = ""):
+    processed = 0
+
+    # Filter out unconvertable 
+    df = df_input[ (df_input['mimeType'] == 'application/vnd.google-apps.folder') | (df_input['mimeType'].isin(GOOGLE_MIME_EXPORT_TYPES.keys())) ]
+
+    # Index by id for in-place updates
+    if 'id_indexed' not in df.attrs:
+        df.set_index('id', inplace=True, drop=False)
+        df.attrs['id_indexed'] = True
+    
+    nfolders = len(df[df['mimeType'] == 'application/vnd.google-apps.folder'])
+    nexportable = len(df) - nfolders
+
+    logger.info(f"Found {nfolders} folders, {nexportable} exportable files, {len(df_input)-nexportable-nfolders} ignored files")
+
+    # For each selected root, ensure the top-level destination folder exists or create it
+    folder_map: Dict[str, str] = {}  # src_folder_id -> dest_folder_id
+    for root_id in selected_roots:
+        if root_id not in df.index:
+            logger.info(f"Root {root_id} not found in inventory; skip.")
+            continue
+        root_row = df.loc[root_id]
+        if root_row['mimeType'] != 'application/vnd.google-apps.folder':
+            logger.info(f"Root {root_id} is not a folder; skip.")
+            continue
+        dest_id = root_row.get('dest_id')
+        if dest_id and str(root_row.get('status', '')) == 'done':
+            folder_map[root_id] = dest_id
+            logger.info(f"Root already copied: {root_row['name']} -> {dest_id}")
+            continue
+        # Create destination root folder (or reuse if dest_id already exists)
+        try:
+            if dest_id:
+                # Validate it still exists and is a folder
+                logger.info(f"Verifying root destination {root_row['name']} -> {dest_id}")
+                meta = drive_get(service, dest_id, fields='id,mimeType')
+                if meta.get('mimeType') != 'application/vnd.google-apps.folder':
+                    raise ValueError("Existing dest_id is not a folder.")
+                new_dest_id = dest_id
+            else:
+                dest_name = f"{name_prefix}{root_row['name']}" if name_prefix else root_row['name']
+                new_dest_id = ensure_dest_folder(service, dest_name, root_row['root_dest_id'])
+            folder_map[root_id] = new_dest_id
+            # Update row
+            df.at[root_id, 'dest_id'] = new_dest_id
+            df.at[root_id, 'status'] = 'done'
+            df.at[root_id, 'error'] = None
+            df.at[root_id, 'last_attempt'] = _now_iso()
+            flush_inventory(df.reset_index(drop=True), inventory_csv)
+            processed += 1
+            logger.info(f"Prepared root: {root_row['name']} -> {new_dest_id}")
+        except Exception as e:
+            df.at[root_id, 'status'] = 'error'
+            df.at[root_id, 'error'] = str(e)
+            df.at[root_id, 'last_attempt'] = _now_iso()
+            df.at[root_id, 'retries'] = int(df.at[root_id, 'retries']) + 1
+            flush_inventory(df.reset_index(drop=True), inventory_csv)
+            logger.error(f"Failed to prepare root {root_row['name']}: {e}")
+
+    # Prepare copy plan: folders first (shallow to deep), then files
+    plan = plan_items_for_copy(df.reset_index(drop=True), selected_roots)
+
+    # Build quick lookup from src_id -> parent_id for ordering validation
+    parent_of: Dict[str, Optional[str]] = {row['id']: (row['parent_id'] if row['parent_id'] else None)
+                                           for _, row in plan.iterrows()}
+
+    total = len(plan)
+    logger.info(f"Starting downloading, converting, and uploading of {total} items under {len(selected_roots)} root(s).")
+
+    nprocessed_files = 1
+    for _, row in plan.iterrows():
+        src_id = row['id']
+        if df.at[src_id, 'status'] == 'done' and df.at[src_id, 'dest_id']:
+            continue  # Already copied
+
+        is_folder = (row['mimeType'] == 'application/vnd.google-apps.folder')
+        src_parent = parent_of.get(src_id)
+
+        # Determine destination parent folder ID
+        if src_parent is None:
+            # Root item itself
+            dest_parent_id = row['root_dest_id']
+        else:
+            # For folders/files not at root, the parent must have been created already
+            parent_dest = df.at[src_parent, 'dest_id'] if (src_parent in df.index and df.at[src_parent, 'dest_id']) else None
+            if not parent_dest:
+                # If parent not yet created, skip for now (shouldn't happen due to sorting), or retry next run
+                logger.error(f"Parent destination missing for {row['path']} (parent {src_parent}). Skipping this run.")
+                continue
+            dest_parent_id = parent_dest
+
+        try:
+            df.at[src_id, 'last_attempt'] = _now_iso()
+            if is_folder:
+                # Create folder if not created
+                if df.at[src_id, 'dest_id']:
+                    # Validate it's a folder
+                    meta = drive_get(service, df.at[src_id, 'dest_id'], fields='id,mimeType')
+                    if meta.get('mimeType') != 'application/vnd.google-apps.folder':
+                        raise ValueError("Existing dest_id is not a folder.")
+                    dest_id = df.at[src_id, 'dest_id']
+                else:
+                    dest_id = ensure_dest_folder(service, row['name'], dest_parent_id)
+                df.at[src_id, 'dest_id'] = dest_id
+                df.at[src_id, 'status'] = 'done'
+                df.at[src_id, 'error'] = None
+            else:
+                logger.info(f"[{nprocessed_files}/{nexportable}] Processing '{row['path']}' ({src_id})")
+                
+                if not (row['mimeType'] in GOOGLE_MIME_EXPORT_TYPES.keys()):
+                    raise ValueError(f"Invalid mime type '{row['mimeType']}' for '{src_id}'")
+                
+                # 1. Download
+                rel_path = row['path'].lstrip('/')
+                local_path = os.path.join(local_parent_dir, rel_path)
+                local_path_dir = os.path.dirname(local_path)
+                filename,ext = os.path.splitext(os.path.basename(local_path))
+                pdf_path = os.path.join(local_path_dir, filename + '.pdf')
+
+                downloaded = False
+                if os.path.exists(local_path):
+                    logger.info(f"> File '{src_id}' is already downloaded. Skipping download.")
+                else:
+                    downloaded = True
+                    logger.info(f"> Downloading {src_id}")
+                    drive_download(service, src_id, local_path)
+
+                # 2. Convert
+                converted = False
+                if downloaded or not os.path.exists(pdf_path):
+                    logger.info(f"> Converting {src_id}")
+                    if local_path.endswith('.docx'):
+                        docx2pdf.convert(local_path, pdf_path)
+                    elif local_path.endswith('.pptx'):
+                        pptxtopdf.convert(local_path, local_path_dir)
+                    else:
+                        raise ValueError(f"Invalid extention '{ext}' when converting to pdf. Only .docx and .pptx are supported.")
+                    converted = True
+                else:
+                    logger.info(f"> PDF '{pdf_path}' already exists. Skipping convert.")
+
+                # 3. Upload
+                # We cannot check if already copied, so upload always
+                desired_name = row['name'] + '.pdf'
+                logger.info(f"> Uploading {src_id}")
+                uploaded = drive_upload(service, pdf_path, dest_parent_id, desired_name=desired_name)
+
+                if not uploaded.get('id', None):
+                    logger.error(f"Error uploading '{src_id}' -> {pdf_path} -> {dest_parent_id}:"
+                                 f"{uploaded}")
+                    raise ValueError(f"Error uploading '{src_id}' -> {pdf_path} -> {dest_parent_id}")
+
+                # 4. Finalize
+                df.at[src_id, 'dest_id'] = uploaded['id']
+                df.at[src_id, 'status'] = 'done'
+                df.at[src_id, 'error'] = None
+                nprocessed_files += 1
+
+            flush_inventory(df.reset_index(drop=True), inventory_csv)
+            processed += 1
+            # if processed % 50 == 0:
+            #     logger.info(f"Progress: {processed}/{total} items done.")
+            logger.info(f"... '{df.at[src_id, 'path']}' done [{processed}/{total}]")
+        except HttpError as e:
+            df.at[src_id, 'status'] = 'error'
+            df.at[src_id, 'error'] = f"HTTP {getattr(e.resp, 'status', '?')}: {e}"
+            df.at[src_id, 'retries'] = int(df.at[src_id, 'retries']) + 1
+            flush_inventory(df.reset_index(drop=True), inventory_csv)
+            logger.error(f"Error processing {row['path']}: {e}")
+        except Exception as e:
+            df.at[src_id, 'status'] = 'error'
+            df.at[src_id, 'error'] = str(e)
+            df.at[src_id, 'retries'] = int(df.at[src_id, 'retries']) + 1
+            flush_inventory(df.reset_index(drop=True), inventory_csv)
+            logger.error(f"Error processing {row['path']}: {e}")
+
+    logger.info("Upload converted PDF complete.")
 
 # ----------------------------
 # CLI
