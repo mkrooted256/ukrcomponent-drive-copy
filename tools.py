@@ -479,15 +479,12 @@ def read_folders_csv(path: str, default_dest_id=None) -> List[dict]:
         reader = csv.DictReader(f)
         for i,r in enumerate(reader):
             if not r.get('destination_id',None):
-                if default_dest_id: 
-                    r['destination_id'] = default_dest_id
-                else: 
-                    raise ValueError(f"Either folders.csv must have 'destination_id' column or dest_id argument must be defined on row {i}")
+                r['destination_id'] = default_dest_id
             if 'id' not in r or 'name' not in r:
                 raise ValueError("folders.csv must have columns: name,id")
             if r['id'].startswith('https://') or r['id'].startswith('drive.google'):
                 r['id'] = gdrive_url_to_id(r['id'])
-            if r['destination_id'].startswith('https://') or r['destination_id'].startswith('drive.google'):
+            if r['destination_id'] and r['destination_id'].startswith('https://') or r['destination_id'].startswith('drive.google'):
                 r['destination_id'] = gdrive_url_to_id(r['destination_id'])
             rows.append({'id': r['id'], 'name': r['name'], 'destination_id': r['destination_id'], 'selected': str(r.get('selected', '')).strip().lower()})
     return rows
