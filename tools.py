@@ -49,6 +49,7 @@ from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
 import docx2pdf
 import pptxtopdf
+import shutil
 
 SCOPES = [
   "https://www.googleapis.com/auth/drive.metadata.readonly",
@@ -419,7 +420,8 @@ def perform_copy(service,
                  inventory_csv: str,
                  selected_roots: List[str],
                 #  dest_root_parent_id: str,
-                 name_prefix: str = ""):
+                 name_prefix: str = "",
+                 only_create_folders = False):
     # validate_dest_is_folder(service, dest_root_parent_id)
 
     # Index by id for in-place updates
@@ -483,6 +485,9 @@ def perform_copy(service,
     total = len(plan)
     logger.info(f"Starting copy of {total} items under {len(selected_roots)} root(s).")
 
+    if only_create_folders:
+        logger.warning(f"Not copying files and only creating folders because {only_create_folders=}")
+
     for _, row in plan.iterrows():
         src_id = row['id']
         if df.at[src_id, 'status'] == 'done' and df.at[src_id, 'dest_id']:
@@ -519,7 +524,7 @@ def perform_copy(service,
                 df.at[src_id, 'dest_id'] = dest_id
                 df.at[src_id, 'status'] = 'done'
                 df.at[src_id, 'error'] = None
-            else:
+            elif not only_create_folders:
                 # Copy file
                 new_id = copy_one_file(service, src_id, dest_parent_id, desired_name=row['name'])
                 df.at[src_id, 'dest_id'] = new_id
@@ -720,7 +725,7 @@ def download_inventory(service, df: pd.DataFrame, inventory_csv: str, output_dir
     flush_inventory(df.reset_index(drop=True), inventory_csv)
     logger.info(f"Download complete. {processed}/{total} files downloaded")
 
-def convert_inventory_to_pdf(service, df_input: pd.DataFrame, inventory_csv: str, local_parent_dir: str, selected_roots: List[str], token_file, name_prefix: str = ""):
+def convert_inventory_to_pdf(service, df_input: pd.DataFrame, inventory_csv: str, local_parent_dir: str, selected_roots: List[str], token_file, name_prefix: str = "", skip_download=False):
     processed = 0
 
     # Filter out unconvertable 
@@ -833,34 +838,40 @@ def convert_inventory_to_pdf(service, df_input: pd.DataFrame, inventory_csv: str
                 if not (row['mimeType'] in GOOGLE_MIME_EXPORT_TYPES.keys()):
                     raise ValueError(f"Invalid mime type '{row['mimeType']}' for '{src_id}'")
                 
-                # 1. Download
+                # Was: foobar.docx -> foobar.pdf
+                # Now: foobar.docx -> foobar.docx.pdf
                 rel_path = row['path'].lstrip('/')
                 local_path = os.path.join(local_parent_dir, rel_path)
                 local_path_dir = os.path.dirname(local_path)
                 filename,ext = os.path.splitext(os.path.basename(local_path))
-                pdf_path = os.path.join(local_path_dir, filename + '.pdf')
+                pdf_path = local_path + '.pdf' # !
+                pdf_path_pptx = os.path.join(local_path_dir, filename + '.pdf')
 
                 downloaded = False
-                if os.path.exists(local_path):
-                    logger.info(f"> File '{src_id}' is already downloaded. Skipping download.")
-                else:
-                    downloaded = True
-                    logger.info(f"> Downloading {src_id}")
-                    drive_download(service, src_id, local_path)
-
-                # 2. Convert
-                converted = False
-                if downloaded or not os.path.exists(pdf_path):
-                    logger.info(f"> Converting {src_id}")
-                    if local_path.endswith('.docx'):
-                        docx2pdf.convert(local_path, pdf_path)
-                    elif local_path.endswith('.pptx'):
-                        pptxtopdf.convert(local_path, local_path_dir)
+                if not skip_download:
+                    # 1. Download
+                    if os.path.exists(local_path):
+                        logger.info(f"> File '{src_id}' is already downloaded. Skipping download.")
                     else:
-                        raise ValueError(f"Invalid extention '{ext}' when converting to pdf. Only .docx and .pptx are supported.")
-                    converted = True
-                else:
-                    logger.info(f"> PDF '{pdf_path}' already exists. Skipping convert.")
+                        downloaded = True
+                        logger.info(f"> Downloading {src_id}")
+                        drive_download(service, src_id, local_path)
+
+                    # 2. Convert
+                    converted = False
+                    if downloaded or not (os.path.exists(pdf_path) or os.path.exists(pdf_path_pptx)):
+                        logger.info(f"> Converting {src_id}")
+                        if local_path.endswith('.docx'):
+                            docx2pdf.convert(local_path, pdf_path)
+                        elif local_path.endswith('.pptx'):
+                            # returns a foobar.pdf, we need to rename it to foobar.pptx.pdf
+                            shutil.move(pdf_path_pptx, pdf_path)
+                            pptxtopdf.convert(local_path, local_path_dir)
+                        else:
+                            raise ValueError(f"Invalid extention '{ext}' when converting to pdf. Only .docx and .pptx are supported.")
+                        converted = True
+                    else:
+                        logger.info(f"> PDF '{pdf_path}' already exists. Skipping convert.")
 
                 # 3. Upload
                 # We cannot check if already copied, so upload always
